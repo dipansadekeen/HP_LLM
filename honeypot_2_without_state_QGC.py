@@ -505,6 +505,574 @@ def rag_retrieve(self, command_id: int, k: int = 3) -> list:
 
 #  /////////// commands //////////
 
+
+# retrieval for commands////////
+def extract_heartbeat_transition_examples(rows: List[Dict[str, Any]], command_id: int, k: int = 2) -> List[Dict[str, Any]]:
+    """
+    Extract command-centered heartbeat transition examples:
+      prev HEARTBEAT -> COMMAND_LONG -> optional COMMAND_ACK -> next HEARTBEAT
+    """
+
+    out = []
+    n = len(rows)
+
+    def msg_type(ex: Dict[str, Any]) -> str:
+        return str(ex.get("mavpackettype") or ex.get("_type") or "").upper()
+
+    def is_heartbeat(ex: Dict[str, Any]) -> bool:
+        return msg_type(ex) == "HEARTBEAT"
+
+    def is_command_long(ex: Dict[str, Any], cmd_id: int) -> bool:
+        if msg_type(ex) != "COMMAND_LONG":
+            return False
+        try:
+            return int(ex.get("command", -1)) == int(cmd_id)
+        except Exception:
+            return False
+
+    def is_command_ack(ex: Dict[str, Any], cmd_id: int) -> bool:
+        if msg_type(ex) != "COMMAND_ACK":
+            return False
+        try:
+            return int(ex.get("command", -1)) == int(cmd_id)
+        except Exception:
+            return False
+
+    def compact_heartbeat(ex: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "base_mode": ex.get("base_mode"),
+            "custom_mode": ex.get("custom_mode"),
+            "system_status": ex.get("system_status"),
+            "type": ex.get("type"),
+            "autopilot": ex.get("autopilot"),
+            "mavlink_version": ex.get("mavlink_version"),
+            "_ts": ex.get("_ts"),
+        }
+
+    def compact_command(ex: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "command": ex.get("command"),
+            "param1": ex.get("param1"),
+            "param2": ex.get("param2"),
+            "param3": ex.get("param3"),
+            "param4": ex.get("param4"),
+            "param5": ex.get("param5"),
+            "param6": ex.get("param6"),
+            "param7": ex.get("param7"),
+            "_ts": ex.get("_ts"),
+        }
+
+    def compact_ack(ex: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "command": ex.get("command"),
+            "result": ex.get("result"),
+            "progress": ex.get("progress"),
+            "result_param2": ex.get("result_param2"),
+            "_ts": ex.get("_ts"),
+        }
+
+    for i, ex in enumerate(rows):
+        if not is_command_long(ex, command_id):
+            continue
+
+        prev_hb = None
+        next_hb = None
+        ack = None
+
+        # nearest previous heartbeat
+        for j in range(i - 1, -1, -1):
+            if is_heartbeat(rows[j]):
+                prev_hb = compact_heartbeat(rows[j])
+                break
+
+        # nearest next ack and next heartbeat
+        for j in range(i + 1, n):
+            if ack is None and is_command_ack(rows[j], command_id):
+                ack = compact_ack(rows[j])
+
+            if next_hb is None and is_heartbeat(rows[j]):
+                next_hb = compact_heartbeat(rows[j])
+                break
+
+        out.append({
+            "command": compact_command(ex),
+            "prev_heartbeat": prev_hb,
+            "ack": ack,
+            "next_heartbeat": next_hb,
+        })
+
+        if len(out) >= k:
+            break
+
+    return out
+
+
+def retrieve_heartbeat_examples_from_sequences(rows: List[Dict[str, Any]], command_id: int, k: int = 2) -> List[Dict[str, Any]]:
+    """
+    Retrieve heartbeat transition examples from px4_command_sequences.jsonl.
+
+    Expected sequence row structure:
+      {
+        "context_prev_heartbeat": {...},
+        "request": {...},
+        "ack": {...},
+        "followups": [...]
+      }
+    """
+
+    out = []
+
+    def compact_hb(hb: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not isinstance(hb, dict):
+            return None
+        return {
+            "base_mode": hb.get("base_mode"),
+            "custom_mode": hb.get("custom_mode"),
+            "system_status": hb.get("system_status"),
+            "type": hb.get("type"),
+            "autopilot": hb.get("autopilot"),
+            "mavlink_version": hb.get("mavlink_version"),
+            "_ts": hb.get("_ts"),
+        }
+
+    def compact_request(req: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not isinstance(req, dict):
+            return None
+        return {
+            "command": req.get("command"),
+            "param1": req.get("param1"),
+            "param2": req.get("param2"),
+            "param3": req.get("param3"),
+            "param4": req.get("param4"),
+            "param5": req.get("param5"),
+            "param6": req.get("param6"),
+            "param7": req.get("param7"),
+            "_ts": req.get("_ts"),
+        }
+
+    def compact_ack(ack: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not isinstance(ack, dict):
+            return None
+        return {
+            "command": ack.get("command"),
+            "result": ack.get("result"),
+            "progress": ack.get("progress"),
+            "result_param2": ack.get("result_param2"),
+            "_ts": ack.get("_ts"),
+        }
+
+    def first_followup_heartbeat(followups: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(followups, list):
+            return None
+        for item in followups:
+            if not isinstance(item, dict):
+                continue
+            mtype = str(item.get("mavpackettype") or item.get("_type") or "").upper()
+            if mtype == "HEARTBEAT":
+                return compact_hb(item)
+        return None
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+
+        req = row.get("request", {})
+        try:
+            req_cmd = int(req.get("command", -1))
+        except Exception:
+            continue
+
+        if req_cmd != int(command_id):
+            continue
+
+        ex = {
+            "command": compact_request(req),
+            "prev_heartbeat": compact_hb(row.get("context_prev_heartbeat")),
+            "ack": compact_ack(row.get("ack")),
+            "next_heartbeat": first_followup_heartbeat(row.get("followups", [])),
+        }
+
+        out.append(ex)
+
+        if len(out) >= k:
+            break
+
+    return out
+# retrieval for commands////////
+
+
+# helpers: handling for telemetry//////////
+TELEM_GROUPS = {
+
+    "GLOBAL_POSITION_INT": [
+        "lat",
+        "lon",
+        "alt",
+        "relative_alt",
+        "vx",
+        "vy",
+        "vz",
+        "hdg",
+    ],
+
+    "ATTITUDE": [
+        "roll",
+        "pitch",
+        "yaw",
+    ],
+
+    "VFR_HUD": [
+        "groundspeed",
+        "heading",
+        "throttle",
+        "alt",
+        "climb",
+    ],
+
+    "SYS_STATUS": [
+        "battery_remaining",
+        "voltage_battery",
+        "load",
+    ],
+
+    "GPS_RAW_INT": [
+        "fix_type",
+    ],
+}
+TELEM_GROUPS_SET = {k: set(v) for k, v in TELEM_GROUPS.items()}
+
+INTERNAL_TO_CANONICAL = {
+    "gpi_lat": ("GLOBAL_POSITION_INT", "lat"),
+    "gpi_lon": ("GLOBAL_POSITION_INT", "lon"),
+    "gpi_alt": ("GLOBAL_POSITION_INT", "alt"),
+    "gpi_relative_alt": ("GLOBAL_POSITION_INT", "relative_alt"),
+    "gpi_vx": ("GLOBAL_POSITION_INT", "vx"),
+    "gpi_vy": ("GLOBAL_POSITION_INT", "vy"),
+    "gpi_vz": ("GLOBAL_POSITION_INT", "vz"),
+    "gpi_hdg": ("GLOBAL_POSITION_INT", "hdg"),
+
+    "roll": ("ATTITUDE", "roll"),
+    "pitch": ("ATTITUDE", "pitch"),
+    "yaw": ("ATTITUDE", "yaw"),
+
+    "vfr_groundspeed": ("VFR_HUD", "groundspeed"),
+    "vfr_heading": ("VFR_HUD", "heading"),
+    "vfr_throttle": ("VFR_HUD", "throttle"),
+    "vfr_alt": ("VFR_HUD", "alt"),
+    "vfr_climb": ("VFR_HUD", "climb"),
+
+    "battery_remaining": ("SYS_STATUS", "battery_remaining"),
+    "voltage_battery": ("SYS_STATUS", "voltage_battery"),
+    "load": ("SYS_STATUS", "load"),
+
+    "gps_fix_type": ("GPS_RAW_INT", "fix_type"),
+}
+
+CANONICAL_TO_INTERNAL = {
+    ("GLOBAL_POSITION_INT", "lat"): "gpi_lat",
+    ("GLOBAL_POSITION_INT", "lon"): "gpi_lon",
+    ("GLOBAL_POSITION_INT", "alt"): "gpi_alt",
+    ("GLOBAL_POSITION_INT", "relative_alt"): "gpi_relative_alt",
+    ("GLOBAL_POSITION_INT", "vx"): "gpi_vx",
+    ("GLOBAL_POSITION_INT", "vy"): "gpi_vy",
+    ("GLOBAL_POSITION_INT", "vz"): "gpi_vz",
+    ("GLOBAL_POSITION_INT", "hdg"): "gpi_hdg",
+
+    ("ATTITUDE", "roll"): "roll",
+    ("ATTITUDE", "pitch"): "pitch",
+    ("ATTITUDE", "yaw"): "yaw",
+
+    ("VFR_HUD", "groundspeed"): "vfr_groundspeed",
+    ("VFR_HUD", "heading"): "vfr_heading",
+    ("VFR_HUD", "throttle"): "vfr_throttle",
+    ("VFR_HUD", "alt"): "vfr_alt",
+    ("VFR_HUD", "climb"): "vfr_climb",
+
+    ("SYS_STATUS", "battery_remaining"): "battery_remaining",
+    ("SYS_STATUS", "voltage_battery"): "voltage_battery",
+    ("SYS_STATUS", "load"): "load",
+
+    ("GPS_RAW_INT", "fix_type"): "gps_fix_type",
+}
+
+def canonicalize_grouped_snapshot(snapshot: dict) -> dict:
+    """
+    Input example:
+    {
+        "GLOBAL_POSITION_INT": {...},
+        "ATTITUDE": {...},
+        "GPS_RAW_INT": {...}
+    }
+
+    Output:
+    same grouped structure, but only allowed telemetry groups/fields.
+    """
+    if not isinstance(snapshot, dict):
+        return {}
+
+    out = {}
+
+    for msg_name, fields in snapshot.items():
+        if msg_name not in TELEM_GROUPS_SET:
+            continue
+        if not isinstance(fields, dict):
+            continue
+
+        allowed = TELEM_GROUPS_SET[msg_name]
+        kept = {k: v for k, v in fields.items() if k in allowed}
+
+        if kept:
+            out[msg_name] = kept
+
+    return out
+
+
+def canonicalize_followup_message(msg: dict) -> dict:
+    """
+    Input example:
+    {"type": "GLOBAL_POSITION_INT", "lat": ..., "lon": ..., "vx": ...}
+
+    Output:
+    {"GLOBAL_POSITION_INT": {"lat": ..., "lon": ..., "vx": ...}}
+    """
+    if not isinstance(msg, dict):
+        return {}
+
+    msg_type = msg.get("type") or msg.get("mavpackettype") or msg.get("_type")
+    if msg_type not in TELEM_GROUPS_SET:
+        return {}
+
+    allowed = TELEM_GROUPS_SET[msg_type]
+    kept = {k: v for k, v in msg.items() if k in allowed}
+
+    if not kept:
+        return {}
+
+    return {msg_type: kept}
+
+def canonicalize_internal_history_fields(fields: dict) -> dict:
+    """
+    Convert your live HistoryBuffer flat internal fields into grouped canonical format.
+    """
+    if not isinstance(fields, dict):
+        return {}
+
+    out = {}
+
+    for k, v in fields.items():
+        mapped = INTERNAL_TO_CANONICAL.get(k)
+        if not mapped:
+            continue
+
+        msg_name, field_name = mapped
+        if msg_name not in out:
+            out[msg_name] = {}
+
+        out[msg_name][field_name] = v
+
+    return out
+
+
+def translate_canonical_fields_to_internal(grouped_fields: dict) -> dict:
+    """
+    Input:
+    {
+        "GLOBAL_POSITION_INT": {"lat": ..., "vx": ...},
+        "ATTITUDE": {"roll": ...}
+    }
+
+    Output:
+    {
+        "gpi_lat": ...,
+        "gpi_vx": ...,
+        "roll": ...
+    }
+    """
+    if not isinstance(grouped_fields, dict):
+        return {}
+
+    out = {}
+
+    for raw_msg_name, msg_fields in grouped_fields.items():
+        msg_name = str(raw_msg_name).upper()
+
+        if msg_name not in TELEM_GROUPS_SET:
+            continue
+        if not isinstance(msg_fields, dict):
+            continue
+
+        for field_name, value in msg_fields.items():
+            key = (msg_name, field_name)
+            internal_name = CANONICAL_TO_INTERNAL.get(key)
+            if internal_name:
+                out[internal_name] = value
+
+    return out
+
+def translate_canonical_series_to_internal(series: list) -> list:
+    """
+    Input:
+    [
+        {"dt": 0.0, "fields": {"GLOBAL_POSITION_INT": {"vx": 100}}},
+        ...
+    ]
+
+    Output:
+    [
+        {"dt": 0.0, "fields": {"gpi_vx": 100}},
+        ...
+    ]
+    """
+    if not isinstance(series, list):
+        return []
+
+    out = []
+
+    for step in series:
+        if not isinstance(step, dict):
+            continue
+
+        dt = float(step.get("dt", 0.0))
+        grouped_fields = step.get("fields", {})
+        flat_fields = translate_canonical_fields_to_internal(grouped_fields)
+
+        out.append({
+            "dt": dt,
+            "fields": flat_fields,
+        })
+
+    return out
+
+
+# ///// Step 2 — retriever from cmd_transition.jsonl
+def retrieve_telemetry_examples_from_cmd_transition(rows, command_id: int, k: int = 2):
+    """
+    Retrieve telemetry transition examples from cmd_transition.jsonl.
+
+    Expected row keys:
+      Prev_HB, Prev_Telemetry, Command, Command_ACK, NEXT_Telemetry
+
+    Prev_Telemetry and NEXT_Telemetry are grouped telemetry snapshots, not lists.
+    """
+    out = []
+
+    for row in rows:
+
+        if not isinstance(row, dict):
+            continue
+
+        cmd = row.get("Command", {})
+        if not isinstance(cmd, dict):
+            continue
+
+        try:
+            cmd_id = int(cmd.get("command", -1))
+        except Exception:
+            continue
+
+        if cmd_id != int(command_id):
+            continue
+
+        prev_telem = canonicalize_grouped_snapshot(
+            row.get("Prev_Telemetry", {})
+        )
+
+        future_telem = canonicalize_grouped_snapshot(
+            row.get("NEXT_Telemetry", {})
+        )
+
+        ex = {
+            "command": {
+                "command": cmd.get("command"),
+                "param1": cmd.get("param1"),
+                "param2": cmd.get("param2"),
+                "param3": cmd.get("param3"),
+                "param4": cmd.get("param4"),
+                "param5": cmd.get("param5"),
+                "param6": cmd.get("param6"),
+                "param7": cmd.get("param7"),
+            },
+            "prev_heartbeat": row.get("Prev_HB", {}),
+            "prev_telemetry": prev_telem,
+            "command_ack": row.get("Command_ACK", {}),
+            "future_telemetry": future_telem,
+        }
+
+        out.append(ex)
+
+        if len(out) >= k:
+            break
+
+    return out
+
+
+# ///// Step 3 — retriever from px4_command_sequences.jsonl
+def retrieve_telemetry_examples_from_sequences(rows, command_id: int, k: int = 2):
+    """
+    Retrieve followup telemetry examples from px4_command_sequences.jsonl.
+
+    followups is a list of MAVLink-like message objects.
+    """
+    out = []
+
+    for row in rows:
+
+        if not isinstance(row, dict):
+            continue
+
+        req = row.get("request", {})
+        if not isinstance(req, dict):
+            continue
+
+        try:
+            cmd_id = int(req.get("command", -1))
+        except Exception:
+            continue
+
+        if cmd_id != int(command_id):
+            continue
+
+        future_telem = []
+        followups = row.get("followups", [])
+
+        if isinstance(followups, list):
+            for item in followups:
+                if not isinstance(item, dict):
+                    continue
+
+                grouped = canonicalize_followup_message(item)
+
+                if grouped:
+                    future_telem.append(grouped)
+
+                if len(future_telem) >= 5:
+                    break
+
+        ex = {
+            "command": {
+                "command": req.get("command"),
+                "param1": req.get("param1"),
+                "param2": req.get("param2"),
+                "param3": req.get("param3"),
+                "param4": req.get("param4"),
+                "param5": req.get("param5"),
+                "param6": req.get("param6"),
+                "param7": req.get("param7"),
+            },
+            "ack": row.get("ack", {}),
+            "future_telemetry": future_telem
+        }
+
+        out.append(ex)
+
+        if len(out) >= k:
+            break
+
+    return out
+# handling for telemetry//////////
+
+
+
 #  /////////// command_ack //////////
 # ----------------------------------------
 # Rule based ACK logic
@@ -512,15 +1080,6 @@ def rag_retrieve(self, command_id: int, k: int = 3) -> list:
 def _is_armed(state) -> bool:
     # PX4: armed flag is base_mode bit 7 (0x80)
     return (int(getattr(state, "base_mode", 0)) & 0x80) != 0
-
-def _set_armed_patch(state, armed: bool):
-    bm = int(getattr(state, "base_mode", 0))
-    if armed:
-        bm |= 0x80
-        return {"base_mode": bm, "system_status": 4}   # ACTIVE
-    else:
-        bm &= ~0x80
-        return {"base_mode": bm, "system_status": 3}   # STANDBY
 
 def _alt_m(state) -> float:
     # Prefer relative altitude in mm if you have it; else use vfr_alt; else 0
@@ -632,10 +1191,6 @@ class LLMHoneypot:
         self.hist = HistoryBuffer(max_hb=10, max_telem=10, max_cmd=10)
 
         # --- command rag (mounted file path from your upload) ---
-        # self.command_rag_path = "../outx/rag_command_transitions.jsonl"
-        # # print("oooooo" + str(os.path.exists(self.command_rag_path))) ## delete later
-        # self.command_rag_rows = load_command_rag_jsonl(self.command_rag_path)
-        # ---  command RAG sources (few-shot for LLM command reasoning) ---
         self.cmd_trace_rows = load_command_rag_jsonl("../out/px4_command_trace.jsonl")
         self.cmd_seq_rows   = load_command_rag_jsonl("../out/px4_command_sequences.jsonl")
 
@@ -655,6 +1210,8 @@ class LLMHoneypot:
         self.param_index = {name: i for i, (name, _, _) in enumerate(self.params)}
         # ////////// for QGC
 
+
+        self.cmd_transition_rows = load_command_rag_jsonl("../out/cmd_transition.jsonl")
 
     # //////// command helpers ///////
 
@@ -682,47 +1239,7 @@ class LLMHoneypot:
             return
         pkt = msg.pack(self.mav_out)
         self.sock.sendto(pkt, self.gcs_addr)
-        print("[TX UDP dst]", self.gcs_addr, "bytes=", len(pkt), flush=True) #debug delete later dlt
-
-
-
-    # ---------------------------
-    # handle_inbound_msg()
-    # ---------------------------
-    # def handle_inbound_msg(self, msg):
-
-    #     msg_type = msg.get_type()
-
-    #     if msg_type == "COMMAND_LONG":
-    #         cmd = msg.command
-
-    #         if cmd == mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM:
-    #             arm = int(msg.param1)
-
-    #             if arm == 1:
-    #                 self.state.base_mode |= 0x80
-    #                 print("[ARMED]")
-    #             else:
-    #                 self.state.base_mode &= ~0x80
-    #                 print("[DISARMED]")
-
-    #             ack = self.mav_out.command_ack_encode(
-    #                 cmd,
-    #                 mavutil.mavlink.MAV_RESULT_ACCEPTED
-    #             )
-    #             self.send_mav(ack)
-
-
-    # ---------------------------
-    # heartbeat_loop()
-    # ---------------------------
-    # def heartbeat_loop(self):
-    #     while True:
-    #         if self.gcs_addr:
-    #             update_time_fields(self.state, self.boot_time)
-    #             hb = make_heartbeat(self.mav_out, self.state)
-    #             self.send_mav(hb)
-    #         time.sleep(1)
+        # print("[TX UDP dst]", self.gcs_addr, "bytes=", len(pkt), flush=True) #debug delete later dlt
 
     # ///////////////HEARTBEAT /////////////////////////
 
@@ -889,59 +1406,103 @@ class LLMHoneypot:
                     self.send_mav(msg)
                 except Exception as e:
                     print(f"[TELEM ERROR] {name}: {e}", flush=True)
+                    continue
 
-                    # after you successfully send a telemetry message, log what you sent (from state fields relevant to that message):
-                    # log telemetry snapshot (minimal fields per message type)
-                    with self.state_lock:
-                        if name == "SYS_STATUS":
-                            self.hist.add_telem(name, {
-                                "voltage_battery": self.state.voltage_battery,
-                                "current_battery": self.state.current_battery,
-                                "battery_remaining": self.state.battery_remaining,
-                                "load": self.state.load,
-                            })
-                        elif name == "GPS_RAW_INT":
-                            self.hist.add_telem(name, {
-                                "time_usec": self.state.time_usec,
-                                "gps_fix_type": self.state.gps_fix_type,
-                                "gps_lat": self.state.gps_lat,
-                                "gps_lon": self.state.gps_lon,
-                                "gps_alt": self.state.gps_alt,
-                                "gps_vel": self.state.gps_vel,
-                                "gps_cog": self.state.gps_cog,
-                                "gps_satellites_visible": self.state.gps_satellites_visible,
-                            })
-                        elif name == "GLOBAL_POSITION_INT":
-                            self.hist.add_telem(name, {
-                                "time_boot_ms": self.state.time_boot_ms,
-                                "gpi_lat": self.state.gpi_lat,
-                                "gpi_lon": self.state.gpi_lon,
-                                "gpi_alt": self.state.gpi_alt,
-                                "gpi_relative_alt": self.state.gpi_relative_alt,
-                                "gpi_vx": self.state.gpi_vx,
-                                "gpi_vy": self.state.gpi_vy,
-                                "gpi_vz": self.state.gpi_vz,
-                                "gpi_hdg": self.state.gpi_hdg,
-                            })
-                        elif name == "ATTITUDE":
-                            self.hist.add_telem(name, {
-                                "time_boot_ms": self.state.time_boot_ms,
-                                "roll": self.state.roll,
-                                "pitch": self.state.pitch,
-                                "yaw": self.state.yaw,
-                                "rollspeed": self.state.rollspeed,
-                                "pitchspeed": self.state.pitchspeed,
-                                "yawspeed": self.state.yawspeed,
-                            })
-                        elif name == "VFR_HUD":
-                            self.hist.add_telem(name, {
-                                "vfr_airspeed": self.state.vfr_airspeed,
-                                "vfr_groundspeed": self.state.vfr_groundspeed,
-                                "vfr_heading": self.state.vfr_heading,
-                                "vfr_throttle": self.state.vfr_throttle,
-                                "vfr_alt": self.state.vfr_alt,
-                                "vfr_climb": self.state.vfr_climb,
-                            })
+                # after you successfully send a telemetry message, log what you sent (from state fields relevant to that message):
+                # log telemetry snapshot (minimal fields per message type)
+                # with self.state_lock:
+                #     if name == "SYS_STATUS":
+                #         self.hist.add_telem(name, {
+                #             "voltage_battery": self.state.voltage_battery,
+                #             "current_battery": self.state.current_battery,
+                #             "battery_remaining": self.state.battery_remaining,
+                #             "load": self.state.load,
+                #         })
+                #     elif name == "GPS_RAW_INT":
+                #         self.hist.add_telem(name, {
+                #             "time_usec": self.state.time_usec,
+                #             "gps_fix_type": self.state.gps_fix_type,
+                #             "gps_lat": self.state.gps_lat,
+                #             "gps_lon": self.state.gps_lon,
+                #             "gps_alt": self.state.gps_alt,
+                #             "gps_vel": self.state.gps_vel,
+                #             "gps_cog": self.state.gps_cog,
+                #             "gps_satellites_visible": self.state.gps_satellites_visible,
+                #         })
+                #     elif name == "GLOBAL_POSITION_INT":
+                #         self.hist.add_telem(name, {
+                #             "time_boot_ms": self.state.time_boot_ms,
+                #             "gpi_lat": self.state.gpi_lat,
+                #             "gpi_lon": self.state.gpi_lon,
+                #             "gpi_alt": self.state.gpi_alt,
+                #             "gpi_relative_alt": self.state.gpi_relative_alt,
+                #             "gpi_vx": self.state.gpi_vx,
+                #             "gpi_vy": self.state.gpi_vy,
+                #             "gpi_vz": self.state.gpi_vz,
+                #             "gpi_hdg": self.state.gpi_hdg,
+                #         })
+                #     elif name == "ATTITUDE":
+                #         self.hist.add_telem(name, {
+                #             "time_boot_ms": self.state.time_boot_ms,
+                #             "roll": self.state.roll,
+                #             "pitch": self.state.pitch,
+                #             "yaw": self.state.yaw,
+                #             "rollspeed": self.state.rollspeed,
+                #             "pitchspeed": self.state.pitchspeed,
+                #             "yawspeed": self.state.yawspeed,
+                #         })
+                #     elif name == "VFR_HUD":
+                #         self.hist.add_telem(name, {
+                #             "vfr_airspeed": self.state.vfr_airspeed,
+                #             "vfr_groundspeed": self.state.vfr_groundspeed,
+                #             "vfr_heading": self.state.vfr_heading,
+                #             "vfr_throttle": self.state.vfr_throttle,
+                #             "vfr_alt": self.state.vfr_alt,
+                #             "vfr_climb": self.state.vfr_climb,
+                #         })
+
+                # ///// new part
+                # log telemetry snapshot AFTER successful send
+                with self.state_lock:
+                    if name == "SYS_STATUS":
+                        self.hist.add_telem(name, {
+                            "battery_remaining": self.state.battery_remaining,
+                            "voltage_battery": self.state.voltage_battery,
+                            "load": self.state.load,
+                        })
+
+                    elif name == "GPS_RAW_INT":
+                        self.hist.add_telem(name, {
+                            "gps_fix_type": self.state.gps_fix_type,
+                        })
+
+                    elif name == "GLOBAL_POSITION_INT":
+                        self.hist.add_telem(name, {
+                            "gpi_lat": self.state.gpi_lat,
+                            "gpi_lon": self.state.gpi_lon,
+                            "gpi_alt": self.state.gpi_alt,
+                            "gpi_relative_alt": self.state.gpi_relative_alt,
+                            "gpi_vx": self.state.gpi_vx,
+                            "gpi_vy": self.state.gpi_vy,
+                            "gpi_vz": self.state.gpi_vz,
+                            "gpi_hdg": self.state.gpi_hdg,
+                        })
+
+                    elif name == "ATTITUDE":
+                        self.hist.add_telem(name, {
+                            "roll": self.state.roll,
+                            "pitch": self.state.pitch,
+                            "yaw": self.state.yaw,
+                        })
+
+                    elif name == "VFR_HUD":
+                        self.hist.add_telem(name, {
+                            "vfr_groundspeed": self.state.vfr_groundspeed,
+                            "vfr_heading": self.state.vfr_heading,
+                            "vfr_throttle": self.state.vfr_throttle,
+                            "vfr_alt": self.state.vfr_alt,
+                            "vfr_climb": self.state.vfr_climb,
+                        })
                 # /////////////// telemetry logging /////
 
                 period = 1.0 / max(0.0001, float(rate_hz))
@@ -1007,8 +1568,6 @@ class LLMHoneypot:
     - roll, pitch, yaw: radians
     """
 
-    # def call_ollama(system_text: str, user_text: str) -> str:
-    # def call_ollama(self, system_text: str, user_text: str) -> str:
     def call_ollama(self, system_text: str, user_text: str, tag: str = "general") -> str:
         payload = {
             "model": self.OLLAMA_MODEL,
@@ -1066,12 +1625,12 @@ class LLMHoneypot:
         with self.state_lock:
             snapshot = self.state.__dict__.copy()
 
-# /////////////////// HEARTBEAT /////////////////////////
+        # /////////////////// HEARTBEAT /////////////////////////
         if context_type == "heartbeat":
             system_text = self.LLM_OUTPUT_RULES + "\n" + HEARTBEAT_PROMPT_PATCH
         else:
             system_text = self.LLM_OUTPUT_RULES
-# /////////////////// HEARTBEAT /////////////////////////
+        # /////////////////// HEARTBEAT /////////////////////////
         
 
         user_text = json.dumps({
@@ -1153,14 +1712,14 @@ class LLMHoneypot:
                 if k not in valid_fields:
                     print(f"[VERIFY FAIL] Invalid telemetry field: {k}")
                     return False
-# ///////////////////////HEARTBEAT /////////////////////////
+        # ///////////////////////HEARTBEAT /////////////////////////
         if self.identity_locked:
             protected = {"hb_type", "hb_autopilot", "mavlink_version"}
             for k in state_patch.keys():
                 if k in protected:
                     print(f"[VERIFY FAIL] Attempt to modify locked identity field: {k}")
                     return False
-# ///////////////////////HEARTBEAT /////////////////////////
+        # ///////////////////////HEARTBEAT /////////////////////////
         return True
 
 
@@ -1199,7 +1758,7 @@ class LLMHoneypot:
 
 
 
-# ////////////handle commands////////////////////////
+    # ////////////handle commands////////////////////////
     # logging the command and response
     def log_cmd_vs_llm(self, cmd: int, params: dict, llm_raw: str, llm_parsed: dict):
         row = {
@@ -1233,30 +1792,30 @@ class LLMHoneypot:
         }
 
         system_text = """
-You are an autopilot behavior generator for a MAVLink honeypot.
-Return ONLY valid JSON. No prose.
+        You are an autopilot behavior generator for a MAVLink honeypot.
+        Return ONLY valid JSON. No prose.
 
-Output EXACTLY:
-{
-  "ack": {"command": <int>, "result": "ACCEPTED|DENIED|UNSUPPORTED|TEMPORARILY_REJECTED", "reason": "short"},
-  "heartbeat_patch": {"base_mode": <int optional>, "custom_mode": <int optional>, "system_status": <int optional>},
-  "state_patch": { "<CommonState field>": <value>, ... },
-  "telemetry_series": [
-    {"dt": 0.0, "fields": {...}},
-    ...
-    {"dt": 0.4, "fields": {...}}
-  ]
-}
+        Output EXACTLY:
+        {
+        "ack": {"command": <int>, "result": "ACCEPTED|DENIED|UNSUPPORTED|TEMPORARILY_REJECTED", "reason": "short"},
+        "heartbeat_patch": {"base_mode": <int optional>, "custom_mode": <int optional>, "system_status": <int optional>},
+        "state_patch": { "<CommonState field>": <value>, ... },
+        "telemetry_series": [
+            {"dt": 0.0, "fields": {...}},
+            ...
+            {"dt": 0.4, "fields": {...}}
+        ]
+        }
 
-Rules:
-- telemetry_series MUST have exactly 5 steps
-- dt values MUST be: 0.0, 0.1, 0.2, 0.3, 0.4 (no other dt allowed).
-- Do NOT include dt=0.5 or dt=1.0.
-- Only use fields that exist in CommonState.
-- Smooth realistic changes (no big jumps).
-- heartbeat_patch may ONLY change base_mode, custom_mode, system_status.
-- base_mode armed flag is bit 7 (0x80); system_status: 3=STANDBY, 4=ACTIVE.
-""".strip()
+        Rules:
+        - telemetry_series MUST have exactly 5 steps
+        - dt values MUST be: 0.0, 0.1, 0.2, 0.3, 0.4 (no other dt allowed).
+        - Do NOT include dt=0.5 or dt=1.0.
+        - Only use fields that exist in CommonState.
+        - Smooth realistic changes (no big jumps).
+        - heartbeat_patch may ONLY change base_mode, custom_mode, system_status.
+        - base_mode armed flag is bit 7 (0x80); system_status: 3=STANDBY, 4=ACTIVE.
+        """.strip()
 
         user_text = json.dumps({
             "command": {"id": int(command_id), "params": params},
@@ -1271,6 +1830,8 @@ Rules:
             # raw = self.call_ollama(system_text, user_text, tag="command")
             # parsed = extract_json(raw)
             # return parsed
+            print("\n[LLM USER PROMPT]")
+            print(user_text)
             raw = self.call_ollama(system_text, user_text, tag="command")
             parsed = extract_json(raw)
             return {"_raw": raw, "_parsed": parsed}
@@ -1332,57 +1893,425 @@ Rules:
                 })
 
         print(f"[CMD APPLY] ack={result_str} scheduled_steps={len(self.override_series)}", flush=True)
+    # for heartbeat based on commands /////////
+    def handle_command_heartbeat(self, command_id: int, params: dict) -> Optional[dict]:
+        """
+        Heartbeat-only LLM handler.
+        Input:
+        - rag traces as example
+        - current command
+        - previous heartbeat only
+        - optional telemetry slot kept commented for later
+        Output:
+        - parsed response dict, or None
+        Side effect:
+        - applies heartbeat patch once if valid
+        """
+        fewshot_seq = retrieve_heartbeat_examples_from_sequences(self.cmd_seq_rows, command_id, k=2)
+        fewshot_trace = []   # keep trace disabled for heartbeat for now
+        # 1) collect only previous heartbeat
+        with self.state_lock:
+            prev_hb = {
+                "hb_type": int(self.state.hb_type),
+                "hb_autopilot": int(self.state.hb_autopilot),
+                "base_mode": int(self.state.base_mode),
+                "custom_mode": int(self.state.custom_mode),
+                "system_status": int(self.state.system_status),
+                "mavlink_version": int(self.state.mavlink_version),
+            }
 
-# ////////////handle commands////////////////////////
+        # Optional telemetry context for later
+        # last_telem = self.hist.snapshot().get("last_telemetry", [])
+        # last_telem = last_telem[-1] if last_telem else None
+
+        system_text = """
+        You are a MAVLink heartbeat patch generator for a drone honeypot.
+
+        You are given:
+        - the current command
+        - the current previous heartbeat
+        - a few command-centered heartbeat transition examples from past traces
+
+        Your task:
+        - compare the current command with the examples
+        - start from previous_heartbeat
+        - produce only the immediate next heartbeat patch
+
+        Return ONLY valid JSON in exactly this format:
+        {
+        "heartbeat_patch": {
+            "base_mode": <int>,
+            "custom_mode": <int>,
+            "system_status": <int>
+        },
+        "reason": "<short>"
+        }
+
+        Rules:
+        - Do NOT invent a new heartbeat from scratch.
+        - Start from previous_heartbeat.
+        - Use the fewshot transition examples to infer whether this command changes heartbeat.
+        - If examples do not show a heartbeat-changing effect, preserve previous heartbeat.
+        - Only command 400 may change the armed bit in base_mode.
+        - For commands other than 400, preserve the armed bit exactly.
+        - heartbeat_patch must contain exactly: base_mode, custom_mode, system_status.
+        - Do not output hb_type, hb_autopilot, mavlink_version, or telemetry fields.
+        - Return JSON only.
+        """.strip()
+
+        user_payload = {
+            "command": {
+                "id": int(command_id),
+                "params": {
+                    "param1": float(params.get("param1", 0.0)),
+                    "param2": float(params.get("param2", 0.0)),
+                    "param3": float(params.get("param3", 0.0)),
+                    "param4": float(params.get("param4", 0.0)),
+                    "param5": float(params.get("param5", 0.0)),
+                    "param6": float(params.get("param6", 0.0)),
+                    "param7": float(params.get("param7", 0.0)),
+                },
+            },
+            "previous_heartbeat": prev_hb,
+            "fewshot": {
+                "sequence_examples": fewshot_seq,
+                "trace_examples": fewshot_trace,
+            },
+            # "previous_telemetry": last_telem,
+            "instruction": "Generate one heartbeat patch for this command."
+        }
+
+        user_text = json.dumps(user_payload)
+
+        try:
+            print("\n[HB LLM USER PROMPT]")
+            print(user_text, flush=True)
+
+            raw = self.call_ollama(system_text, user_text, tag="heartbeat_command")
+            parsed = extract_json(raw)
+
+            print("\n[HB LLM RAW RESPONSE]")
+            print(raw, flush=True)
+
+            if not parsed:
+                print("[HB LLM] JSON parse failed", flush=True)
+                return None
+
+            if not self.validate_heartbeat_patch_response(parsed, prev_hb):
+                print("[HB LLM] heartbeat patch validation failed", flush=True)
+                return None
+
+            patch = parsed.get("heartbeat_patch", {})
+            self.apply_heartbeat_patch(patch)
+
+            print("\n[HB PATCH APPLIED]")
+            print(json.dumps(patch, indent=2), flush=True)
+
+            return parsed
+
+        except Exception as e:
+            print(f"[HB LLM ERROR] {e}", flush=True)
+            return None
+
+    def validate_heartbeat_patch_response(self, response: dict, prev_hb: dict) -> bool:
+        """
+        Validate heartbeat-only LLM response.
+        """
+
+        if not isinstance(response, dict):
+            return False
+
+        if "heartbeat_patch" not in response:
+            print("[HB VERIFY FAIL] missing heartbeat_patch", flush=True)
+            return False
+
+        patch = response.get("heartbeat_patch")
+        if not isinstance(patch, dict):
+            print("[HB VERIFY FAIL] heartbeat_patch is not dict", flush=True)
+            return False
+
+        allowed = {"base_mode", "custom_mode", "system_status"}
+        required = {"base_mode", "custom_mode", "system_status"}
+
+        # Must contain exactly the required fields for this version
+        if set(patch.keys()) != required:
+            print(f"[HB VERIFY FAIL] patch keys must be exactly {required}, got {set(patch.keys())}", flush=True)
+            return False
+
+        for k, v in patch.items():
+            if k not in allowed:
+                print(f"[HB VERIFY FAIL] invalid field: {k}", flush=True)
+                return False
+            if not isinstance(v, int):
+                # allow float that is integer-like
+                if isinstance(v, float) and float(v).is_integer():
+                    patch[k] = int(v)
+                else:
+                    print(f"[HB VERIFY FAIL] non-integer value for {k}: {v}", flush=True)
+                    return False
+
+        # protect identity fields implicitly by not allowing them at all
+        # optional plausibility checks
+        if patch["base_mode"] < 0:
+            print("[HB VERIFY FAIL] base_mode negative", flush=True)
+            return False
+
+        if patch["system_status"] < 0:
+            print("[HB VERIFY FAIL] system_status negative", flush=True)
+            return False
+
+        return True
 
 
-#     def handle_inbound_msg(self, msg):
+    def apply_heartbeat_patch(self, patch: dict) -> None:
+        """
+        Apply heartbeat-only patch once.
+        """
 
-#         msg_type = msg.get_type()
-#         attacker_msg = {"type": msg_type}
+        if not isinstance(patch, dict):
+            return
 
-# # ////////////// telemetry /////////////////////
-#         # --- Stream requests can arrive in TWO forms ---
+        allowed = {"base_mode", "custom_mode", "system_status"}
 
-#         # (A) Direct SET_MESSAGE_INTERVAL message
-#         if msg_type == "SET_MESSAGE_INTERVAL":
-#             msg_id = int(getattr(msg, "message_id", -1))
-#             interval_us = int(getattr(msg, "interval_us", 0))
-#             self._apply_message_interval_request(msg_id, interval_us)
-#             return
+        with self.state_lock:
+            for k, v in patch.items():
+                if k in allowed:
+                    setattr(self.state, k, int(v))
 
-#         # (B) COMMAND_LONG using MAV_CMD_SET_MESSAGE_INTERVAL
-#         # -------------------------
-#         if msg_type == "COMMAND_LONG":
-#             cmd = int(getattr(msg, "command", -1))
 
-#             # ignore interval command here (already handled above)
-#             if cmd == mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL:
-#                 return
+    # for heartbeat based on commands /////////
 
-#             params = {
-#                 "param1": float(getattr(msg, "param1", 0.0)),
-#                 "param2": float(getattr(msg, "param2", 0.0)),
-#                 "param3": float(getattr(msg, "param3", 0.0)),
-#                 "param4": float(getattr(msg, "param4", 0.0)),
-#                 "param5": float(getattr(msg, "param5", 0.0)),
-#                 "param6": float(getattr(msg, "param6", 0.0)),
-#                 "param7": float(getattr(msg, "param7", 0.0)),
-#             }
+    # for telemetry based on commands /////////
+    def get_current_heartbeat_snapshot(self) -> dict:
+        with self.state_lock:
+            return {
+                "base_mode": int(self.state.base_mode),
+                "custom_mode": int(self.state.custom_mode),
+                "system_status": int(self.state.system_status),
+            }
 
-#             # log command into history
-#             self.hist.add_cmd(cmd, params)
 
-#             # ask LLM
-#             resp = self.llm_prompt_command(cmd, params)
-#             if resp:
-#                 self.apply_llm_command_result(resp)
-#             else:
-#                 # fallback: unsupported ack
-#                 ack_msg = self.mav_out.command_ack_encode(cmd, mavutil.mavlink.MAV_RESULT_UNSUPPORTED)
-#                 self.send_mav(ack_msg)
+    # ------ validator 
 
-#             return
+    def get_last_5_telemetry_snapshots(self) -> list:
+        hist = self.hist.snapshot().get("last_telemetry", [])
+        out = []
+
+        for item in hist[-5:]:
+            if not isinstance(item, dict):
+                continue
+
+            fields = item.get("fields", {})
+            if not isinstance(fields, dict):
+                continue
+
+            grouped = canonicalize_internal_history_fields(fields)
+            if not grouped:
+                continue
+
+            out.append({
+                "name": item.get("name"),
+                "ts": item.get("ts"),
+                "fields": grouped,
+            })
+
+        return out
+        
+    # ----prompting
+    def handle_command_telemetry(self, command_id: int, params: dict) -> Optional[dict]:
+        """
+        Telemetry-only LLM handler.
+        Uses:
+          - current command
+          - current heartbeat
+          - last 5 live telemetry
+          - transition examples from cmd_transition.jsonl
+          - sequence followup examples from px4_command_sequences.jsonl
+        """
+
+        last_5_telem = self.get_last_5_telemetry_snapshots()
+        current_hb = self.get_current_heartbeat_snapshot()
+
+        transition_examples = retrieve_telemetry_examples_from_cmd_transition(
+            self.cmd_transition_rows, command_id, k=2
+        )
+        sequence_examples = retrieve_telemetry_examples_from_sequences(
+            self.cmd_seq_rows, command_id, k=2
+        )
+        print("[--DEBUG--] last_5_telemetry_count =", len(last_5_telem))
+        print("[--DEBUG--] transition_examples =", len(transition_examples))
+        print("[--DEBUG--] sequence_examples =", len(sequence_examples))
+        
+        system_text = """
+You are a MAVLink telemetry predictor for a drone honeypot.
+
+You are given:
+- the current command
+- the current heartbeat
+- the last 5 live telemetry snapshots
+- transition examples from past traces
+- short future telemetry examples from past traces
+- the allowed telemetry schema
+
+Your task:
+- generate the next 5 telemetry states after this command
+- use only canonical MAVLink telemetry names
+- group telemetry by MAVLink message name
+- follow the allowed telemetry schema exactly
+
+Return ONLY valid JSON in exactly this format:
+{
+  "telemetry_series": [
+    {"dt": 0.0, "fields": {}},
+    {"dt": 0.1, "fields": {}},
+    {"dt": 0.2, "fields": {}},
+    {"dt": 0.3, "fields": {}},
+    {"dt": 0.4, "fields": {}}
+  ],
+  "reason": "<short>"
+}
+
+Rules:
+- Only use message groups and fields defined in allowed_telemetry_groups.
+- Do not use internal/private variable names.
+- Keep changes smooth and realistic.
+- If a field is not needed, omit it.
+- Return JSON only.
+""".strip()
+        user_payload = {
+            "command": {
+                "id": int(command_id),
+                "params": {
+                    "param1": float(params.get("param1", 0.0)),
+                    "param2": float(params.get("param2", 0.0)),
+                    "param3": float(params.get("param3", 0.0)),
+                    "param4": float(params.get("param4", 0.0)),
+                    "param5": float(params.get("param5", 0.0)),
+                    "param6": float(params.get("param6", 0.0)),
+                    "param7": float(params.get("param7", 0.0)),
+                },
+            },
+            "current_heartbeat": current_hb,
+            "last_5_telemetry": last_5_telem,
+            "transition_examples": transition_examples,
+            "sequence_examples": sequence_examples,
+            "allowed_telemetry_groups": TELEM_GROUPS,
+            "instruction": "Generate the next 5 telemetry states using canonical MAVLink field names grouped by message."
+        }
+
+        user_text = json.dumps(user_payload)
+
+        try:
+            print("\n[TELEM LLM USER PROMPT]")
+            print(user_text, flush=True)
+
+            raw = self.call_ollama(system_text, user_text, tag="telemetry_command")
+            parsed = extract_json(raw)
+
+            print("\n[TELEM LLM RAW RESPONSE]")
+            print(raw, flush=True)
+
+            if not parsed:
+                print("[TELEM LLM] JSON parse failed", flush=True)
+                return None
+
+            if not self.validate_telemetry_response(parsed):
+                print("[TELEM LLM] validation failed", flush=True)
+                return None
+
+            # series = parsed.get("telemetry_series", [])
+            # base = time.monotonic()
+
+            # with self.override_lock:
+            #     self.override_series.clear()
+            #     for step in series:
+            #         self.override_series.append({
+            #             "apply_at": base + float(step["dt"]),
+            #             "fields": step["fields"],
+            #         })
+
+            series = parsed.get("telemetry_series", [])
+            translated_series = translate_canonical_series_to_internal(series)
+
+            # if not self.validate_internal_translated_series(translated_series):
+            #     print("[TELEM LLM] translated series validation failed", flush=True)
+            #     return None
+
+            base = time.monotonic()
+
+            with self.override_lock:
+                self.override_series.clear()
+                for step in translated_series:
+                    self.override_series.append({
+                        "apply_at": base + float(step["dt"]),
+                        "fields": step["fields"],
+                    })
+
+            print(f"[TELEM SERIES SCHEDULED] steps={len(self.override_series)}", flush=True)
+            return parsed
+
+        except Exception as e:
+            print(f"[TELEM LLM ERROR] {e}", flush=True)
+            return None
+
+    def validate_telemetry_response(self, response: dict) -> bool:
+        if not isinstance(response, dict):
+            print("[TELEM VERIFY FAIL] response is not dict", flush=True)
+            return False
+
+        series = response.get("telemetry_series")
+        if not isinstance(series, list):
+            print("[TELEM VERIFY FAIL] telemetry_series missing or not list", flush=True)
+            return False
+
+        if len(series) != 5:
+            print("[TELEM VERIFY FAIL] telemetry_series must have 5 steps", flush=True)
+            return False
+
+        expected_dts = [0.0, 0.1, 0.2, 0.3, 0.4]
+
+        for i, step in enumerate(series):
+            if not isinstance(step, dict):
+                print("[TELEM VERIFY FAIL] step is not dict", flush=True)
+                return False
+
+            if "dt" not in step or "fields" not in step:
+                print("[TELEM VERIFY FAIL] step missing dt or fields", flush=True)
+                return False
+
+            try:
+                dt = round(float(step["dt"]), 1)
+            except Exception:
+                print("[TELEM VERIFY FAIL] dt is not numeric", flush=True)
+                return False
+
+            if dt != expected_dts[i]:
+                print(f"[TELEM VERIFY FAIL] bad dt at index {i}: {dt}", flush=True)
+                return False
+
+            fields = step["fields"]
+            if not isinstance(fields, dict):
+                print("[TELEM VERIFY FAIL] fields is not dict", flush=True)
+                return False
+
+            for msg_name, msg_fields in fields.items():
+                if msg_name not in TELEM_GROUPS_SET:
+                    print(f"[TELEM VERIFY FAIL] invalid message group: {msg_name}", flush=True)
+                    return False
+
+                if not isinstance(msg_fields, dict):
+                    print(f"[TELEM VERIFY FAIL] fields for {msg_name} must be dict", flush=True)
+                    return False
+
+                allowed_fields = TELEM_GROUPS_SET[msg_name]
+
+                for field_name in msg_fields.keys():
+                    if field_name not in allowed_fields:
+                        print(f"[TELEM VERIFY FAIL] invalid field {msg_name}.{field_name}", flush=True)
+                        return False
+
+        return True
+    # for telemetry based on commands /////////
 
     def handle_inbound_msg(self, msg):
         """
@@ -1563,40 +2492,37 @@ Rules:
             #     self.send_mav(ack_msg)
             #     return
 
-            resp_wrap = self.llm_prompt_command(cmd, params)
+            # /////////////////////////////////////////////////////
+            # resp_wrap = self.llm_prompt_command(cmd, params)
 
-            # commented bcz it push the ack from LLM.
+            # # 4) write one combined log row (rule ack + llm ack)
+            # os.makedirs("./logs", exist_ok=True)
+            # llm_ack = (resp_wrap.get("_parsed") or {}).get("ack", {}) if resp_wrap else {}
+            # with open("./logs/cmd_ack_llm_log.jsonl", "a") as f:
+            #     f.write(json.dumps({
+            #         "ts": time.time(),
+            #         "cmd": int(cmd),
+            #         "params": params,
+            #         "ack_rule": {"result_int": int(result), "reason": reason},
+            #         "ack_llm": llm_ack,
+            #         "llm_raw": resp_wrap.get("_raw","") if resp_wrap else "",
+            #         "llm_parsed": resp_wrap.get("_parsed") if resp_wrap else None
+            #     }) + "\n")
+
+            # # 5) apply telemetry scheduling only
             # if resp_wrap and resp_wrap.get("_parsed"):
-            #     self.log_cmd_vs_llm(cmd, params, resp_wrap.get("_raw",""), resp_wrap["_parsed"])
             #     self.apply_llm_command_result(resp_wrap["_parsed"])
             # else:
-            #     ack_msg = self.mav_out.command_ack_encode(cmd, mavutil.mavlink.MAV_RESULT_UNSUPPORTED)
-            #     self.send_mav(ack_msg)
-            #     print(f"[LLM CMD FAIL] id={cmd} -> UNSUPPORTED", flush=True)
-            
+            #     print(f"[LLM CMD FAIL] id={cmd} (no telemetry scheduled)", flush=True)
+
             # return
-            # commented bcz it push the ack from LLM.
+            # /////////////////////////////////////////////////////
 
-            # fixed with the static ack.
-            # 4) write one combined log row (rule ack + llm ack)
-            os.makedirs("./logs", exist_ok=True)
-            llm_ack = (resp_wrap.get("_parsed") or {}).get("ack", {}) if resp_wrap else {}
-            with open("./logs/cmd_ack_llm_log.jsonl", "a") as f:
-                f.write(json.dumps({
-                    "ts": time.time(),
-                    "cmd": int(cmd),
-                    "params": params,
-                    "ack_rule": {"result_int": int(result), "reason": reason},
-                    "ack_llm": llm_ack,
-                    "llm_raw": resp_wrap.get("_raw","") if resp_wrap else "",
-                    "llm_parsed": resp_wrap.get("_parsed") if resp_wrap else None
-                }) + "\n")
+            # 1) heartbeat-only LLM module
+            hb_resp = self.handle_command_heartbeat(cmd, params)
 
-            # 5) apply telemetry scheduling only
-            if resp_wrap and resp_wrap.get("_parsed"):
-                self.apply_llm_command_result(resp_wrap["_parsed"])
-            else:
-                print(f"[LLM CMD FAIL] id={cmd} (no telemetry scheduled)", flush=True)
+            # 2) telemetry module will be added later
+            telem_resp = self.handle_command_telemetry(cmd, params)
 
             return
 
@@ -1607,19 +2533,19 @@ Rules:
 
 
 
-# ////////////// telemetry /////////////////////
+        # ////////////// telemetry /////////////////////
 
 
 
-# commenting for static heartbeat testing ////////////////////////
+        # commenting for static heartbeat testing ////////////////////////
 
-        # if self.llm_enabled:
-        #     response = self.llm_prompt(attacker_msg)
+                # if self.llm_enabled:
+                #     response = self.llm_prompt(attacker_msg)
 
-        #     if response and self.verify_response(response):
-        #         self.llm_logging(attacker_msg, response)
-        #         self.llm_output_process(response)
-# commenting for static heartbeat testing ////////////////////////
+                #     if response and self.verify_response(response):
+                #         self.llm_logging(attacker_msg, response)
+                #         self.llm_output_process(response)
+        # commenting for static heartbeat testing ////////////////////////
 
 
 
@@ -1631,13 +2557,13 @@ Rules:
         # threading.Thread(target=self.heartbeat_loop, daemon=True).start()
 
 
-# ///////////// HEARTBEAT /////////////////////////
+        # ///////////// HEARTBEAT /////////////////////////
         # 1️⃣ Initialize identity
         self.initialize_heartbeat_identity()
 
         # 2️⃣ Start heartbeat thread
         threading.Thread(target=self.heartbeat_loop, daemon=True).start()
-# ///////////// HEARTBEAT /////////////////////////
+        # ///////////// HEARTBEAT /////////////////////////
 
 
         # 3️⃣ Start request-driven telemetry scheduler
